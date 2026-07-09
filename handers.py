@@ -1,53 +1,36 @@
-from abc import ABC, abstractmethod
+from handlers import BaseHandler # Assuming BaseHandler is still in handlers.py
 from models import PipelineContext
-from factory import TenantConfigFactory
-import time
+from redis_client import get_redis_client
 
-class IHandler(ABC):
-    @abstractmethod
-    def set_next(self, handler: 'IHandler') -> 'IHandler':
-        pass
-
-    @abstractmethod
-    async def handle(self, context: PipelineContext) -> PipelineContext:
-        pass
-
-class BaseHandler(IHandler):
-    _next_handler: IHandler = None
-
-    def set_next(self, handler: 'IHandler') -> 'IHandler':
-        self._next_handler = handler
-        return handler
+class RedisRateLimitHandler(BaseHandler):
+    def __init__(self):
+        self.redis = get_redis_client()
+        
+        # Define limits per tier (Requests per minute)
+        self.tier_limits = {
+            "premium": 1000,
+            "free": 10
+        }
+        self.window_seconds = 60
 
     async def handle(self, context: PipelineContext) -> PipelineContext:
-        if self._next_handler:
-            return await self._next_handler.handle(context)
-        return context
-
-class RateLimitHandler(BaseHandler):
-    async def handle(self, context: PipelineContext) -> PipelineContext:
-        # Simple simulated rate limiting constraint
-        # In V2, you would connect this to a Redis distributed token bucket
-        if context.rate_limit_tier == "free" and "block_me" in context.payload.lower():
+        # Determine the limit based on the tenant's tier
+        limit = self.tier_limits.get(context.rate_limit_tier, 10)
+        
+        # Create a unique Redis key for this tenant
+        redis_key = f"rate_limit:{context.tenant_id}"
+        
+        # Atomically increment the counter in Redis
+        current_requests = await self.redis.incr(redis_key)
+        
+        # If this is the first request in the window, set the expiration timer
+        if current_requests == 1:
+            await self.redis.expire(redis_key, self.window_seconds)
+            
+        # Check if they breached the limit
+        if current_requests > limit:
             context.is_blocked = True
-            context.block_reason = "Rate limit exceeded for Free Tier profile."
+            context.block_reason = f"Redis Rate Limit Exceeded: {limit} requests per {self.window_seconds}s allowed."
             return context  # Short-circuit the chain
             
-        return await super().handle(context)
-
-class DeepPayloadInspectionHandler(BaseHandler):
-    async def handle(self, context: PipelineContext) -> PipelineContext:
-        # Dynamically fetch the scanning strategies via the Factory pattern
-        strategies = TenantConfigFactory.get_strategies_for_tenant(context.tenant_id)
-        
-        for strategy in strategies:
-            result = strategy.scan(context.payload)
-            context.scan_results.append(result)
-            
-            # Block request immediately if a high-severity strategy violation occurs
-            if not result.passed and result.risk_score >= 0.8:
-                context.is_blocked = True
-                context.block_reason = f"Security Policy Violation flagged by: {strategy.name}"
-                return context  # Short-circuit the chain
-                
         return await super().handle(context)
